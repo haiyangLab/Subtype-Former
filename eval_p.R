@@ -1,0 +1,131 @@
+library(optparse)
+library(survival)
+require(SNFtool)
+require(parallel)
+source("NEMO.R")
+source("NEMO_RESULTS.R")
+source("benchmark.R")
+options(stringsAsFactors = FALSE)
+
+check.survival <- function(groups, ori_surv_data) {
+  patient.names = names(groups) # 
+  patient.names.in.file = as.character(ori_surv_data[, 1]) # %in%: %in% is a more intuitive interface as a binary operator, which returns a logical vector indicating if there is a match or not for its left operand.
+  stopifnot(all(patient.names %in% patient.names.in.file)) # stopifnot: If any of the expressions (in ... or exprs) are not all TRUE, stop is called, producing an error message indicating the first expression which was not (all) true.
+  indices = match(patient.names, patient.names.in.file) # match: match returns a vector of the positions of (first) matches of its first argument in its second.
+  ordered.survival.data = ori_surv_data[indices,]
+  ordered.survival.data <- transform(ordered.survival.data, Survival = as.numeric(days), Death = as.numeric(status))
+  ordered.survival.data["cluster"] <- groups
+  ordered.survival.data$Survival[is.na(ordered.survival.data$Survival)] = 0
+  ordered.survival.data$Death[is.na(ordered.survival.data$Death)] = 0
+  return(survdiff(Surv(Survival, Death) ~ cluster, data = ordered.survival.data)) # survdiff: Tests if there is a difference between two or more survival curves using the G-rho family of tests, or for a single curve against a known alternative.
+}
+
+get.empirical.surv <- function(clustering, subtype) {
+  set.seed(42)
+  survival.file.path <- paste("./r_clinic/", subtype, ".clinic", sep = "")
+  ori_surv_data <- read.table(survival.file.path, header = TRUE, sep = ",", check.names = FALSE,)
+  surv.ret = check.survival(clustering, ori_surv_data)
+  orig.chisq = surv.ret$chisq
+  orig.pvalue = get.logrank.pvalue(surv.ret)
+  #return(orig.pvalue)
+  #The initial number of permutations to run
+  num.perms = round(min(max(10 / orig.pvalue, 1000), 1e6))
+  should.continue = T
+  
+  total.num.perms = 0
+  total.num.extreme.chisq = 0
+  
+  while (should.continue) {
+    print('Another iteration in empirical survival calculation')
+    print(num.perms)
+    perm.chisq = as.numeric(mclapply(1:num.perms, function(i) {
+      cur.clustering = sample(clustering)
+      names(cur.clustering) = names(clustering)
+      cur.chisq = check.survival(cur.clustering, ori_surv_data)$chisq
+      return(cur.chisq)
+    }, mc.cores = 1))
+    
+    total.num.perms = total.num.perms + num.perms
+    total.num.extreme.chisq = total.num.extreme.chisq + sum(perm.chisq >= orig.chisq)
+    
+    binom.ret = binom.test(total.num.extreme.chisq, total.num.perms)
+    cur.pvalue = binom.ret$estimate
+    cur.conf.int = binom.ret$conf.int
+    
+    print(c(total.num.extreme.chisq, total.num.perms))
+    print(cur.pvalue)
+    print(cur.conf.int)
+    
+    sig.threshold = 0.05
+    is.conf.small = ((cur.conf.int[2] - cur.pvalue) < min(cur.pvalue / 10, 0.01)) & ((cur.pvalue - cur.conf.int[1]) < min(cur.pvalue / 10, 0.01))
+    is.threshold.in.conf = cur.conf.int[1] < sig.threshold & cur.conf.int[2] > sig.threshold
+    if ((is.conf.small & !is.threshold.in.conf) | (total.num.perms > 2e-7)) {
+      should.continue = F
+    } else {
+      num.perms = 1e5
+    }
+  }
+  
+  return(cur.pvalue)
+}
+
+option_list = list(
+  make_option(c("-m", "--method"), action = "store", default = 'SubtypeFormer',
+              type = 'character', help = "Path to genelist"),
+  make_option(c("-t", "--type"), action = "store", default = 'BRCA',
+              type = 'character', help = "Path to genelist")
+)
+opt = parse_args(OptionParser(option_list = option_list))
+cluster_file <- paste("./results/temp/", opt$type, ".", opt$method, sep = "")
+clinic_file <- paste("./r_clinic/", opt$type, ".clinic", sep = "")
+sig_file <- paste("./results/temp/", opt$type, ".", opt$method, ".sig", sep = "")
+atac_data <- read.table(cluster_file, check.names = FALSE, row.names = 1, header = TRUE, sep = '\t')
+samples <- read.table(clinic_file, check.names = FALSE, row.names = 1, header = TRUE, sep = ',')
+
+ids <- intersect(rownames(atac_data), rownames(samples))
+samples <- samples[ids,]
+samples$label <- atac_data[ids, 1]
+subs <- samples[!samples$status %in% c('[Not Available]', '[Not Applicable]', '[Discrepancy]'),]
+subs <- samples[!samples$days %in% c('[Not Available]', '[Not Applicable]', '[Discrepancy]'),]
+clustring <- subs[, 'label']
+names(clustring) <- rownames(subs)
+clinical_params_1 <- list('gender', 'pathologic_M', 'pathologic_N', 'pathologic_T', 'pathologic_stage')
+clinical_params_2 <- list('age_at_initial_pathologic_diagnosis')
+
+#sdf <- survdiff(Surv(atac_sample$days, atac_sample$status) ~ atac_data$label)
+# y <- exactLR(0, Surv(days, status) ~ label, atac_sample, "exact")
+# pvalue1 <- paste(opt$method, "    Log rank test p=", signif(y$p, 2), sep = "")
+pvalues <- c()
+pvalue1 <- get.empirical.surv(clustring, opt$type)
+#pvalue1 <- paste(opt$method, "    Log rank test p=", signif(1 - pchisq(sdf$chisq, length(sdf$n) - 1), 2), sep = "")
+
+pvalues = c(pvalues, pvalue1)
+pvalue2 <- c()
+for (i in clinical_params_1) {
+  subs <- samples[!samples[[i]] %in% c('[Not Available]', '[Not Applicable]', '[Discrepancy]'),]
+  tryCatch(
+    expr = {
+      pvalue2 <- get.empirical.clinical(subs$label, subs[, i], T)
+    },
+    error = function(e) {
+      print(e)
+      pvalue2 <- 1
+    }
+  )
+  pvalues = c(pvalues, pvalue2)
+}
+i <- clinical_params_2[[1]]
+subs <- samples[!samples[[i]] %in% c('[Not Available]', '[Not Applicable]', '[Discrepancy]'),]
+tryCatch(
+  expr = {
+    pvalue3 <- get.empirical.clinical(subs$label, subs[, i], F)
+  },
+  error = function(e) {
+    print(e)
+    pvalue3 <- 1
+  }
+)
+print(pvalue3)
+pvalues = c(pvalues, pvalue3)
+df <- as.data.frame(pvalues, col.names = c("sig"))
+write.table(df, file = sig_file, quote = FALSE, sep = "\t", row.names = FALSE)

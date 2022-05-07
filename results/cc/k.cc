@@ -1,0 +1,13 @@
+BRCA, k=4
+UCEC, k=4
+HNSC, k=5
+BRCA, k=4
+UCEC, k=4
+HNSC, k=5
+THCA, k=4
+LUAD, k=3
+KIRC, k=3
+PRAD, k=3
+LUSC, k=3
+SKCM, k=3
+STAD, k=3
